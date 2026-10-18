@@ -81,10 +81,14 @@ for pair in os.environ.get("RESULT_ACTION_OVERRIDES", "").split(","):
 
 
 # ---------------------------------------------------------------- Meta API ---
+class TooMuchData(Exception):
+    """Metaが「要求データ量が多すぎる」(code 1 / 2) を返したとき"""
+
+
 def get(url, params, retries=6):
     params = {**params, "access_token": TOKEN}
     for attempt in range(retries):
-        r = requests.get(url, params=params, timeout=120)
+        r = requests.get(url, params=params, timeout=180)
         if r.status_code == 200:
             return r.json()
         try:
@@ -92,31 +96,47 @@ def get(url, params, retries=6):
         except Exception:
             err = {}
         code = err.get("code")
-        # 17 / 4 / 32 / 613 / 80004 = レート制限系
+        msg = (err.get("message") or r.text[:200]).replace("\n", " ")
+        # 1 / 2 = データ量過多・一時的に利用不可 → 呼び出し側で件数を減らして再試行
+        if code in (1, 2):
+            print(f"  too much data ({code}): {msg}", flush=True)
+            raise TooMuchData(msg)
+        # 4 / 17 / 32 / 613 / 80004 = レート制限
         if code in (4, 17, 32, 613, 80004) or r.status_code >= 500:
             wait = min(60 * (attempt + 1), 300)
-            print(f"  rate limit / server error ({code}). wait {wait}s", flush=True)
+            print(f"  rate limit / server error ({code}): {msg}. wait {wait}s", flush=True)
             time.sleep(wait)
             continue
-        raise RuntimeError(f"Meta API error {r.status_code}: {r.text[:500]}")
+        raise RuntimeError(f"Meta API error {r.status_code} (code {code}): {msg}")
     raise RuntimeError("Meta API: retry exhausted")
 
 
-def paginate(url, params):
+def paginate(url, params, limit=100, min_limit=10):
+    """ページ送りで全件取得。データ量過多エラーが出たら limit を半分にしてやり直す"""
     while True:
-        data = get(url, params)
-        yield from data.get("data", [])
-        nxt = data.get("paging", {}).get("next")
-        if not nxt:
-            return
-        url, params = nxt, {}
+        try:
+            results = []
+            u, p = url, {**params, "limit": limit}
+            while True:
+                data = get(u, p)
+                results.extend(data.get("data", []))
+                nxt = data.get("paging", {}).get("next")
+                if not nxt:
+                    return results
+                u, p = nxt, {}
+        except TooMuchData:
+            if limit <= min_limit:
+                raise RuntimeError("Meta API: data too large even at minimum page size")
+            limit = max(min_limit, limit // 2)
+            print(f"  retry with limit={limit}", flush=True)
+            time.sleep(5)
 
 
 def fetch_ad_urls(account):
     """広告ID → 設定URL（リンク先）を取得"""
     fields = "id,creative{link_url,object_story_spec,asset_feed_spec}"
     urls = {}
-    for ad in paginate(f"{BASE}/{account}/ads", {"fields": fields, "limit": 500}):
+    for ad in paginate(f"{BASE}/{account}/ads", {"fields": fields}, limit=100):
         urls[ad["id"]] = extract_link(ad.get("creative") or {})
     return urls
 
@@ -173,12 +193,11 @@ def fetch_insights(account, start, end):
         "time_increment": 1,
         "time_range": json.dumps({"since": start, "until": end}),
         "fields": fields,
-        "limit": 500,
     }
-    return list(paginate(f"{BASE}/{account}/insights", params))
+    return paginate(f"{BASE}/{account}/insights", params, limit=100)
 
 
-def daterange_chunks(start, end, days=14):
+def daterange_chunks(start, end, days=7):
     cur = start
     while cur <= end:
         nxt = min(cur + timedelta(days=days - 1), end)
