@@ -1,0 +1,37 @@
+name: Meta Ads -> Google Sheets (daily)
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 毎日 09:00 JST（UTC 00:00）
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "開始日 YYYY-MM-DD（過去分の一括取得時のみ）"
+        required: false
+      end_date:
+        description: "終了日 YYYY-MM-DD"
+        required: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run sync
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_IDS: ${{ secrets.META_AD_ACCOUNT_IDS }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          META_API_VERSION: ${{ secrets.META_API_VERSION }}
+          DAYS_BACK: "3"
+        run: |
+          if [ -n "${{ github.event.inputs.start_date }}" ]; then
+            python meta_ads_to_sheets.py "${{ github.event.inputs.start_date }}" "${{ github.event.inputs.end_date }}"
+          else
+            python meta_ads_to_sheets.py
+          fi
