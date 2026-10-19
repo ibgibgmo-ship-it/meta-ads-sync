@@ -1,8 +1,11 @@
 name: Meta Ads -> Google Sheets (daily)
 
 on:
-  schedule:
-    - cron: "0 0 * * *"   # 毎日 09:00 JST（UTC 00:00）
+  schedule:                 # 日本時間 9:30 / 15:30 / 18:00 / 20:30（UTC表記）
+    - cron: "30 0 * * *"
+    - cron: "30 6 * * *"
+    - cron: "0 9 * * *"
+    - cron: "30 11 * * *"
   workflow_dispatch:
     inputs:
       start_date:
@@ -28,6 +31,8 @@ jobs:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           META_API_VERSION: ${{ secrets.META_API_VERSION }}
+          META_ACCOUNT_NAMES: "1day小顔,A式切開リフト"   # 対象アカウント（名前の一部）
+          META_START_DATE: "2026-10-01"                   # この日から今日までを毎回取り直す
           DAYS_BACK: "3"
         run: |
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
