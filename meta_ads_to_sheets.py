@@ -89,7 +89,7 @@ class TooMuchData(Exception):
     """Metaが「要求データ量が多すぎる」(code 1 / 2) を返したとき"""
 
 
-def get(url, params, retries=6):
+def get(url, params, retries=14):
     params = {**params, "access_token": TOKEN}
     for attempt in range(retries):
         r = requests.get(url, params=params, timeout=180)
@@ -107,7 +107,8 @@ def get(url, params, retries=6):
             raise TooMuchData(msg)
         # 4 / 17 / 32 / 613 / 80004 = レート制限
         if code in (4, 17, 32, 613, 80004) or r.status_code >= 500:
-            wait = min(60 * (attempt + 1), 300)
+            # 広告アカウント単位の制限(80004)は1時間窓で回復するため、長めに待つ（最長 約65分）
+            wait = 60 if attempt == 0 else 300
             print(f"  rate limit / server error ({code}): {msg}. wait {wait}s", flush=True)
             time.sleep(wait)
             continue
@@ -153,13 +154,43 @@ def resolve_accounts():
     return found
 
 
-def fetch_ad_urls(account):
-    """広告ID → 設定URL（リンク先）を取得"""
-    fields = "id,creative{link_url,object_story_spec,asset_feed_spec}"
-    urls = {}
-    for ad in paginate(f"{BASE}/{account}/ads", {"fields": fields}, limit=100):
-        urls[ad["id"]] = extract_link(ad.get("creative") or {})
-    return urls
+URL_TAB = "ad_urls"
+
+
+def load_url_cache(sh):
+    """ad_urls タブから ad_id -> link_url のキャッシュを読む"""
+    try:
+        ws = sh.worksheet(URL_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(URL_TAB, rows=1000, cols=2)
+        ws.append_row(["ad_id", "link_url"])
+        return ws, {}
+    cache = {}
+    for row in ws.get_all_values()[1:]:
+        if row and row[0]:
+            cache[row[0]] = row[1] if len(row) > 1 else ""
+    return ws, cache
+
+
+def save_url_cache(ws, cache):
+    rows = [["ad_id", "link_url"]] + [[k, v] for k, v in sorted(cache.items())]
+    ws.clear()
+    ws.update(range_name="A1", values=rows, value_input_option="RAW")
+
+
+def fetch_ad_urls_for(ad_ids, cache):
+    """キャッシュに無い広告IDだけ、50件ずつまとめてリンク先URLを取得"""
+    missing = [a for a in ad_ids if a and a not in cache]
+    if not missing:
+        return 0
+    fields = "creative{link_url,object_story_spec,asset_feed_spec}"
+    for i in range(0, len(missing), 50):
+        chunk = missing[i:i + 50]
+        data = get(f"{BASE}/", {"ids": ",".join(chunk), "fields": fields})
+        for ad_id in chunk:
+            ad = data.get(ad_id) or {}
+            cache[ad_id] = extract_link(ad.get("creative") or {})
+    return len(missing)
 
 
 def extract_link(creative):
@@ -227,13 +258,16 @@ def daterange_chunks(start, end, days=7):
 
 
 # ------------------------------------------------------------- Google Sheets ---
-def open_sheet():
+def open_spreadsheet():
     info = json.loads(os.environ["GOOGLE_SA_JSON"])
     creds = Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SHEET_ID)
+    return gc.open_by_key(SHEET_ID)
+
+
+def open_sheet(sh):
     try:
         ws = sh.worksheet(SHEET_TAB)
     except gspread.WorksheetNotFound:
@@ -276,28 +310,45 @@ def main():
     print(f"range: {start} .. {end}, accounts: {len(accounts)}", flush=True)
 
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    rows = []
+    sh = open_spreadsheet()
+    url_ws, url_cache = load_url_cache(sh)
+    print(f"url cache: {len(url_cache)} ads", flush=True)
+
+    rows, done, failed = [], [], []
     for acc in accounts:
-        print(f"[{acc}] fetching ad URLs", flush=True)
-        urls = fetch_ad_urls(acc)
-        for s, e in daterange_chunks(start, end):
-            print(f"[{acc}] insights {s}..{e}", flush=True)
-            for r in fetch_insights(acc, s, e):
+        try:
+            acc_rows = []
+            for s_, e_ in daterange_chunks(start, end):
+                print(f"[{acc}] insights {s_}..{e_}", flush=True)
+                acc_rows.extend(fetch_insights(acc, s_, e_))
+            ad_ids = sorted({r.get("ad_id", "") for r in acc_rows})
+            n = fetch_ad_urls_for(ad_ids, url_cache)
+            print(f"[{acc}] {len(acc_rows)} rows, {len(ad_ids)} ads ({n} new URLs fetched)", flush=True)
+            if n:
+                save_url_cache(url_ws, url_cache)
+            for r in acc_rows:
                 results, rtype = pick_result(r)
                 rows.append([
                     r["date_start"], r["account_id"], r.get("account_name", ""),
                     r.get("campaign_id", ""), r.get("campaign_name", ""),
                     r.get("adset_id", ""), r.get("adset_name", ""),
-                    r.get("ad_id", ""), r.get("ad_name", ""), urls.get(r.get("ad_id", ""), ""),
+                    r.get("ad_id", ""), r.get("ad_name", ""), url_cache.get(r.get("ad_id", ""), ""),
                     int(r.get("impressions", 0)), float(r.get("spend", 0)),
                     int(r.get("inline_link_clicks", 0)), int(r.get("reach", 0)),
                     results, rtype, r.get("objective", ""), r.get("optimization_goal", ""),
                     now,
                 ])
-    print(f"fetched {len(rows)} rows", flush=True)
+            done.append(acc)
+        except Exception as ex:  # 1アカウントの失敗で全体を止めない
+            print(f"[{acc}] FAILED: {ex}", flush=True)
+            failed.append(acc)
 
-    ws = open_sheet()
-    upsert(ws, rows, start.isoformat(), end.isoformat(), accounts)
+    print(f"fetched {len(rows)} rows from {len(done)} accounts", flush=True)
+    if done:
+        ws = open_sheet(sh)
+        upsert(ws, rows, start.isoformat(), end.isoformat(), done)
+    if failed:
+        raise SystemExit(f"failed accounts (次回実行で取り直されます): {failed}")
 
 
 if __name__ == "__main__":
