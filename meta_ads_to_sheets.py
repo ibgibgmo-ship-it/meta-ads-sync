@@ -48,7 +48,7 @@ HEADER = [
     "campaign_id", "campaign_name",
     "adset_id", "adset_name",
     "ad_id", "ad_name", "link_url",
-    "impressions", "spend", "clicks", "reach",
+    "impressions", "spend", "link_clicks", "reach",
     "results", "result_type", "objective", "optimization_goal",
     "updated_at",
 ]
@@ -206,7 +206,7 @@ def fetch_insights(account, start, end):
         "campaign_id", "campaign_name",
         "adset_id", "adset_name",
         "ad_id", "ad_name",
-        "impressions", "spend", "clicks", "reach",
+        "impressions", "spend", "inline_link_clicks", "reach",
         "actions", "objective", "optimization_goal",
     ])
     params = {
@@ -290,7 +290,7 @@ def main():
                     r.get("adset_id", ""), r.get("adset_name", ""),
                     r.get("ad_id", ""), r.get("ad_name", ""), urls.get(r.get("ad_id", ""), ""),
                     int(r.get("impressions", 0)), float(r.get("spend", 0)),
-                    int(r.get("clicks", 0)), int(r.get("reach", 0)),
+                    int(r.get("inline_link_clicks", 0)), int(r.get("reach", 0)),
                     results, rtype, r.get("objective", ""), r.get("optimization_goal", ""),
                     now,
                 ])
