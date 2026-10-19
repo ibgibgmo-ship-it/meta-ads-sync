@@ -31,8 +31,6 @@ jobs:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           META_API_VERSION: ${{ secrets.META_API_VERSION }}
-          META_ACCOUNT_NAMES: "1day小顔,A式切開リフト"   # 対象アカウント（名前の一部）
-          META_START_DATE: "2026-10-01"                   # この日から今日までを毎回取り直す
           DAYS_BACK: "3"
         run: |
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
