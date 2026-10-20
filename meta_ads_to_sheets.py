@@ -24,7 +24,9 @@ Googleスプレッドシートに書き込むスクリプト。
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
 import gspread
@@ -42,6 +44,7 @@ START_DATE_FIXED = os.environ.get("META_START_DATE", "").strip()
 SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = os.environ.get("SHEET_TAB", "data")
 DAYS_BACK = int(os.environ.get("DAYS_BACK", "3"))
+PARALLEL = int(os.environ.get("PARALLEL", "4"))  # 同時に処理するアカウント数
 
 HEADER = [
     "date", "account_id", "account_name",
@@ -89,10 +92,13 @@ class TooMuchData(Exception):
     """Metaが「要求データ量が多すぎる」(code 1 / 2) を返したとき"""
 
 
-def get(url, params, retries=14):
+def request(method, url, params, retries=14):
     params = {**params, "access_token": TOKEN}
     for attempt in range(retries):
-        r = requests.get(url, params=params, timeout=180)
+        if method == "POST":
+            r = requests.post(url, data=params, timeout=180)
+        else:
+            r = requests.get(url, params=params, timeout=180)
         if r.status_code == 200:
             return r.json()
         try:
@@ -101,19 +107,50 @@ def get(url, params, retries=14):
             err = {}
         code = err.get("code")
         msg = (err.get("message") or r.text[:200]).replace("\n", " ")
+        # 100 = パラメータ不正（廃止された書き方など）。待っても直らないので即終了
+        if code == 100:
+            raise RuntimeError(f"Meta API error (code 100): {msg}")
         # 1 / 2 = データ量過多・一時的に利用不可 → 呼び出し側で件数を減らして再試行
         if code in (1, 2):
             print(f"  too much data ({code}): {msg}", flush=True)
             raise TooMuchData(msg)
         # 4 / 17 / 32 / 613 / 80004 = レート制限
         if code in (4, 17, 32, 613, 80004) or r.status_code >= 500:
-            # 広告アカウント単位の制限(80004)は1時間窓で回復するため、長めに待つ（最長 約65分）
-            wait = 60 if attempt == 0 else 300
+            # Metaが返す「回復までの時間」があればそれに合わせ、無ければ段階的に待つ
+            wait = regain_seconds(r.headers) or (60 if attempt == 0 else 300)
             print(f"  rate limit / server error ({code}): {msg}. wait {wait}s", flush=True)
             time.sleep(wait)
             continue
         raise RuntimeError(f"Meta API error {r.status_code} (code {code}): {msg}")
     raise RuntimeError("Meta API: retry exhausted")
+
+
+def get(url, params, retries=14):
+    return request("GET", url, params, retries)
+
+
+def post(url, params, retries=14):
+    return request("POST", url, params, retries)
+
+
+def regain_seconds(headers):
+    """x-business-use-case-usage / x-ad-account-usage から回復までの秒数を取り出す"""
+    for key in ("x-business-use-case-usage", "x-ad-account-usage"):
+        raw = headers.get(key)
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        items = []
+        if isinstance(obj, dict):
+            for v in obj.values():
+                items.extend(v if isinstance(v, list) else [v])
+        for it in items:
+            if isinstance(it, dict) and it.get("estimated_time_to_regain_access"):
+                return min(int(it["estimated_time_to_regain_access"]) * 60 + 15, 3600)
+    return 0
 
 
 def paginate(url, params, limit=100, min_limit=10):
@@ -179,17 +216,24 @@ def save_url_cache(ws, cache):
 
 
 def fetch_ad_urls_for(ad_ids, cache):
-    """キャッシュに無い広告IDだけ、50件ずつまとめてリンク先URLを取得"""
+    """キャッシュに無い広告IDだけ、バッチリクエスト（50件/回）でリンク先URLを取得"""
     missing = [a for a in ad_ids if a and a not in cache]
     if not missing:
         return 0
     fields = "creative{link_url,object_story_spec,asset_feed_spec}"
     for i in range(0, len(missing), 50):
         chunk = missing[i:i + 50]
-        data = get(f"{BASE}/", {"ids": ",".join(chunk), "fields": fields})
-        for ad_id in chunk:
-            ad = data.get(ad_id) or {}
-            cache[ad_id] = extract_link(ad.get("creative") or {})
+        batch = [{"method": "GET", "relative_url": f"{API_VERSION}/{ad_id}?fields={fields}"} for ad_id in chunk]
+        res = post("https://graph.facebook.com/", {"batch": json.dumps(batch), "include_headers": "false"})
+        for ad_id, item in zip(chunk, res if isinstance(res, list) else []):
+            link = ""
+            if isinstance(item, dict) and item.get("code") == 200:
+                try:
+                    body = json.loads(item.get("body") or "{}")
+                    link = extract_link(body.get("creative") or {})
+                except Exception:
+                    link = ""
+            cache[ad_id] = link
     return len(missing)
 
 
@@ -246,10 +290,10 @@ def fetch_insights(account, start, end):
         "time_range": json.dumps({"since": start, "until": end}),
         "fields": fields,
     }
-    return paginate(f"{BASE}/{account}/insights", params, limit=100)
+    return paginate(f"{BASE}/{account}/insights", params, limit=500)
 
 
-def daterange_chunks(start, end, days=7):
+def daterange_chunks(start, end, days=14):
     cur = start
     while cur <= end:
         nxt = min(cur + timedelta(days=days - 1), end)
@@ -315,34 +359,52 @@ def main():
     print(f"url cache: {len(url_cache)} ads", flush=True)
 
     rows, done, failed = [], [], []
-    for acc in accounts:
-        try:
-            acc_rows = []
-            for s_, e_ in daterange_chunks(start, end):
-                print(f"[{acc}] insights {s_}..{e_}", flush=True)
-                acc_rows.extend(fetch_insights(acc, s_, e_))
-            ad_ids = sorted({r.get("ad_id", "") for r in acc_rows})
-            n = fetch_ad_urls_for(ad_ids, url_cache)
-            print(f"[{acc}] {len(acc_rows)} rows, {len(ad_ids)} ads ({n} new URLs fetched)", flush=True)
-            if n:
-                save_url_cache(url_ws, url_cache)
-            for r in acc_rows:
-                results, rtype = pick_result(r)
-                rows.append([
-                    r["date_start"], r["account_id"], r.get("account_name", ""),
-                    r.get("campaign_id", ""), r.get("campaign_name", ""),
-                    r.get("adset_id", ""), r.get("adset_name", ""),
-                    r.get("ad_id", ""), r.get("ad_name", ""), url_cache.get(r.get("ad_id", ""), ""),
-                    int(r.get("impressions", 0)), float(r.get("spend", 0)),
-                    int(r.get("inline_link_clicks", 0)), int(r.get("reach", 0)),
-                    results, rtype, r.get("objective", ""), r.get("optimization_goal", ""),
-                    now,
-                ])
-            done.append(acc)
-        except Exception as ex:  # 1アカウントの失敗で全体を止めない
-            print(f"[{acc}] FAILED: {ex}", flush=True)
-            failed.append(acc)
+    lock = threading.Lock()
 
+    def process(acc):
+        t0 = time.time()
+        acc_rows = []
+        for s_, e_ in daterange_chunks(start, end):
+            print(f"[{acc}] insights {s_}..{e_}", flush=True)
+            acc_rows.extend(fetch_insights(acc, s_, e_))
+        ad_ids = sorted({r.get("ad_id", "") for r in acc_rows})
+        with lock:
+            known = dict(url_cache)
+        fetched = {}
+        missing = [a for a in ad_ids if a and a not in known]
+        if missing:
+            fetch_ad_urls_for(missing, fetched)
+        with lock:
+            url_cache.update(fetched)
+            urls = dict(url_cache)
+        out = []
+        for r in acc_rows:
+            results, rtype = pick_result(r)
+            out.append([
+                r["date_start"], r["account_id"], r.get("account_name", ""),
+                r.get("campaign_id", ""), r.get("campaign_name", ""),
+                r.get("adset_id", ""), r.get("adset_name", ""),
+                r.get("ad_id", ""), r.get("ad_name", ""), urls.get(r.get("ad_id", ""), ""),
+                int(r.get("impressions", 0)), float(r.get("spend", 0)),
+                int(r.get("inline_link_clicks", 0)), int(r.get("reach", 0)),
+                results, rtype, r.get("objective", ""), r.get("optimization_goal", ""),
+                now,
+            ])
+        print(f"[{acc}] done: {len(out)} rows, {len(missing)} new URLs, {time.time() - t0:.0f}s", flush=True)
+        return out
+
+    with ThreadPoolExecutor(max_workers=PARALLEL) as ex:
+        futures = {ex.submit(process, acc): acc for acc in accounts}
+        for fut, acc in futures.items():
+            try:
+                rows.extend(fut.result())
+                done.append(acc)
+            except Exception as e:  # 1アカウントの失敗で全体を止めない
+                print(f"[{acc}] FAILED: {e}", flush=True)
+                failed.append(acc)
+
+    if url_cache:
+        save_url_cache(url_ws, url_cache)
     print(f"fetched {len(rows)} rows from {len(done)} accounts", flush=True)
     if done:
         ws = open_sheet(sh)
