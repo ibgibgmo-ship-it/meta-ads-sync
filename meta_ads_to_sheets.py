@@ -275,25 +275,59 @@ def pick_result(row):
     return int(val), atype
 
 
+INSIGHT_FIELDS = ",".join([
+    "account_id", "account_name",
+    "campaign_id", "campaign_name",
+    "adset_id", "adset_name",
+    "ad_id", "ad_name",
+    "impressions", "spend", "inline_link_clicks", "reach",
+    "actions", "objective", "optimization_goal",
+])
+
+
 def fetch_insights(account, start, end):
-    fields = ",".join([
-        "account_id", "account_name",
-        "campaign_id", "campaign_name",
-        "adset_id", "adset_name",
-        "ad_id", "ad_name",
-        "impressions", "spend", "inline_link_clicks", "reach",
-        "actions", "objective", "optimization_goal",
-    ])
+    """非同期レポート: ジョブを作成 → 完了まで待つ → 結果を取得（Meta推奨の方式）"""
     params = {
         "level": "ad",
         "time_increment": 1,
         "time_range": json.dumps({"since": start, "until": end}),
-        "fields": fields,
+        "fields": INSIGHT_FIELDS,
     }
-    return paginate(f"{BASE}/{account}/insights", params, limit=500)
+    for attempt in range(3):
+        job = post(f"{BASE}/{account}/insights", params)
+        run_id = job.get("report_run_id")
+        if not run_id:
+            raise RuntimeError(f"insights job not created: {job}")
+        deadline = time.time() + 20 * 60
+        while time.time() < deadline:
+            st = get(f"{BASE}/{run_id}", {"fields": "async_status,async_percent_completion"})
+            status = st.get("async_status")
+            if status == "Job Completed":
+                return paginate(f"{BASE}/{run_id}/insights", {}, limit=500)
+            if status in ("Job Failed", "Job Skipped"):
+                print(f"[{account}] report job {status}, retrying", flush=True)
+                time.sleep(30)
+                break
+            time.sleep(5)
+        else:
+            print(f"[{account}] report job timeout, retrying", flush=True)
+    raise RuntimeError("insights job did not complete")
 
 
-def daterange_chunks(start, end, days=14):
+def rows_look_valid(acc_rows):
+    """Metaが不完全な応答を返したときの検知: クリック/結果があるのに imp 0、クリック > imp など"""
+    for r in acc_rows:
+        imp = int(r.get("impressions", 0) or 0)
+        clk = int(r.get("inline_link_clicks", 0) or 0)
+        spend = float(r.get("spend", 0) or 0)
+        if imp == 0 and (clk > 0 or spend > 0):
+            return False
+        if clk > imp:
+            return False
+    return True
+
+
+def daterange_chunks(start, end, days=31):
     cur = start
     while cur <= end:
         nxt = min(cur + timedelta(days=days - 1), end)
@@ -367,6 +401,8 @@ def main():
         for s_, e_ in daterange_chunks(start, end):
             print(f"[{acc}] insights {s_}..{e_}", flush=True)
             acc_rows.extend(fetch_insights(acc, s_, e_))
+        if not rows_look_valid(acc_rows):
+            raise RuntimeError("不完全なデータ（imp 0 でクリックあり等）が返されたため、このアカウントは上書きしません")
         ad_ids = sorted({r.get("ad_id", "") for r in acc_rows})
         with lock:
             known = dict(url_cache)
