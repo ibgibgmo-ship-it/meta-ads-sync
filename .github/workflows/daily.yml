@@ -31,7 +31,7 @@ jobs:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           META_API_VERSION: ${{ secrets.META_API_VERSION }}
-          DAYS_BACK: "3"
+          DAYS_BACK: "7"
         run: |
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
             python meta_ads_to_sheets.py "${{ github.event.inputs.start_date }}" "${{ github.event.inputs.end_date }}"
