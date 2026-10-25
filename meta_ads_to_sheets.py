@@ -323,7 +323,19 @@ def extract_link(creative):
 
 
 def pick_result(row):
-    """actions配列から「結果」を1つ選ぶ"""
+    """「結果」: Metaの results フィールド（管理画面の「結果」と同じ）を優先し、無ければ actions から推測"""
+    res = row.get("results")
+    if isinstance(res, list) and res:
+        first = res[0] if isinstance(res[0], dict) else {}
+        indicator = str(first.get("indicator", ""))
+        total = 0.0
+        for v in first.get("values") or []:
+            try:
+                total += float((v or {}).get("value", 0) or 0)
+            except Exception:
+                pass
+        if indicator:
+            return int(round(total)), indicator.split(":")[-1]
     actions = {a["action_type"]: float(a.get("value", 0)) for a in row.get("actions") or []}
     atype = (
         OVERRIDES.get(row.get("campaign_id"))
@@ -345,7 +357,7 @@ INSIGHT_FIELDS = ",".join([
     "adset_id", "adset_name",
     "ad_id", "ad_name",
     "impressions", "spend", "inline_link_clicks", "reach",
-    "actions", "objective", "optimization_goal",
+    "results", "actions", "objective", "optimization_goal",
 ])
 
 
@@ -358,7 +370,14 @@ def fetch_insights(account, start, end):
         "fields": INSIGHT_FIELDS,
     }
     for attempt in range(3):
-        job = post(f"{BASE}/{account}/insights", params)
+        try:
+            job = post(f"{BASE}/{account}/insights", params)
+        except RuntimeError as e:
+            if "results" in str(e) and "results," in params["fields"]:
+                print(f"[{account}] results field unsupported, falling back", flush=True)
+                params["fields"] = params["fields"].replace("results,", "")
+                continue
+            raise
         run_id = job.get("report_run_id")
         if not run_id:
             raise RuntimeError(f"insights job not created: {job}")
