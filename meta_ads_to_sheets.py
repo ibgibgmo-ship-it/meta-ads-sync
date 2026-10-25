@@ -238,9 +238,11 @@ def fetch_ad_urls_for(ad_ids, cache):
     missing = [a for a in ad_ids if a and not cache.get(a)]
     if not missing:
         return 0
-    fields = "creative{link_url,object_story_spec,asset_feed_spec,effective_object_story_id,template_url,link_destination_display_url}"
+    fields = ("creative{link_url,call_to_action,object_story_spec,asset_feed_spec,effective_object_story_id,"
+              "effective_instagram_media_id,instagram_permalink_url,template_url,link_destination_display_url,object_url}")
     bodies = batch_get([f"{API_VERSION}/{ad_id}?fields={fields}" for ad_id in missing])
     need_post = []
+    unresolved = []
     for ad_id, body in zip(missing, bodies):
         creative = (body or {}).get("creative") or {}
         link = extract_link(creative)
@@ -248,6 +250,8 @@ def fetch_ad_urls_for(ad_ids, cache):
             cache[ad_id] = link
         elif creative.get("effective_object_story_id"):
             need_post.append((ad_id, creative["effective_object_story_id"]))
+        else:
+            unresolved.append((ad_id, creative))
     # 既存投稿を使った広告: 投稿側のリンク/CTAを見る
     if need_post:
         bodies = batch_get([f"{API_VERSION}/{pid}?fields=link,call_to_action,attachments{{url,unshimmed_url,target}}" for _, pid in need_post])
@@ -255,6 +259,11 @@ def fetch_ad_urls_for(ad_ids, cache):
             link = extract_post_link(body or {})
             if link:
                 cache[ad_id] = link
+            else:
+                unresolved.append((ad_id, {"post": body}))
+    # 取れなかった広告の生データを先頭3件だけログに出す（原因調査用）
+    for ad_id, raw in unresolved[:3]:
+        print(f"  no-url ad {ad_id}: {json.dumps(raw, ensure_ascii=False)[:600]}", flush=True)
     return len(missing)
 
 
@@ -277,6 +286,13 @@ def extract_post_link(post):
 def extract_link(creative):
     if creative.get("link_url"):
         return creative["link_url"]
+    # 既存投稿 + CTAボタン: クリエイティブ側の call_to_action にURLが入る
+    cta = creative.get("call_to_action") or {}
+    cta_link = (cta.get("value") or {}).get("link") or (cta.get("value") or {}).get("link_caption")
+    if cta_link:
+        return cta_link
+    if creative.get("object_url"):
+        return creative["object_url"]
     oss = creative.get("object_story_spec") or {}
     ld = oss.get("link_data") or {}
     if ld.get("link"):
