@@ -210,31 +210,68 @@ def load_url_cache(sh):
 
 
 def save_url_cache(ws, cache):
-    rows = [["ad_id", "link_url"]] + [[k, v] for k, v in sorted(cache.items())]
+    rows = [["ad_id", "link_url"]] + [[k, v] for k, v in sorted(cache.items()) if v]
     ws.clear()
     ws.update(range_name="A1", values=rows, value_input_option="RAW")
 
 
-def fetch_ad_urls_for(ad_ids, cache):
-    """キャッシュに無い広告IDだけ、バッチリクエスト（50件/回）でリンク先URLを取得"""
-    missing = [a for a in ad_ids if a and a not in cache]
-    if not missing:
-        return 0
-    fields = "creative{link_url,object_story_spec,asset_feed_spec}"
-    for i in range(0, len(missing), 50):
-        chunk = missing[i:i + 50]
-        batch = [{"method": "GET", "relative_url": f"{API_VERSION}/{ad_id}?fields={fields}"} for ad_id in chunk]
+def batch_get(relative_urls):
+    """Graph API バッチ（50件/回）。戻り値: relative_url順の JSON（失敗は None）"""
+    out = []
+    for i in range(0, len(relative_urls), 50):
+        chunk = relative_urls[i:i + 50]
+        batch = [{"method": "GET", "relative_url": u} for u in chunk]
         res = post("https://graph.facebook.com/", {"batch": json.dumps(batch), "include_headers": "false"})
-        for ad_id, item in zip(chunk, res if isinstance(res, list) else []):
-            link = ""
+        for item in (res if isinstance(res, list) else [None] * len(chunk)):
+            body = None
             if isinstance(item, dict) and item.get("code") == 200:
                 try:
                     body = json.loads(item.get("body") or "{}")
-                    link = extract_link(body.get("creative") or {})
                 except Exception:
-                    link = ""
+                    body = None
+            out.append(body)
+    return out
+
+
+def fetch_ad_urls_for(ad_ids, cache):
+    """キャッシュに無い（または空の）広告IDだけリンク先URLを取得"""
+    missing = [a for a in ad_ids if a and not cache.get(a)]
+    if not missing:
+        return 0
+    fields = "creative{link_url,object_story_spec,asset_feed_spec,effective_object_story_id,template_url,link_destination_display_url}"
+    bodies = batch_get([f"{API_VERSION}/{ad_id}?fields={fields}" for ad_id in missing])
+    need_post = []
+    for ad_id, body in zip(missing, bodies):
+        creative = (body or {}).get("creative") or {}
+        link = extract_link(creative)
+        if link:
             cache[ad_id] = link
+        elif creative.get("effective_object_story_id"):
+            need_post.append((ad_id, creative["effective_object_story_id"]))
+    # 既存投稿を使った広告: 投稿側のリンク/CTAを見る
+    if need_post:
+        bodies = batch_get([f"{API_VERSION}/{pid}?fields=link,call_to_action,attachments{{url,unshimmed_url,target}}" for _, pid in need_post])
+        for (ad_id, _), body in zip(need_post, bodies):
+            link = extract_post_link(body or {})
+            if link:
+                cache[ad_id] = link
     return len(missing)
+
+
+def extract_post_link(post):
+    if post.get("link"):
+        return post["link"]
+    cta = ((post.get("call_to_action") or {}).get("value") or {}).get("link")
+    if cta:
+        return cta
+    for att in (post.get("attachments") or {}).get("data") or []:
+        for key in ("unshimmed_url", "url"):
+            if att.get(key):
+                return att[key]
+        tgt = att.get("target") or {}
+        if tgt.get("url"):
+            return tgt["url"]
+    return ""
 
 
 def extract_link(creative):
@@ -251,10 +288,21 @@ def extract_link(creative):
     cta_link = ((vd.get("call_to_action") or {}).get("value") or {}).get("link")
     if cta_link:
         return cta_link
+    td = oss.get("template_data") or {}
+    if td.get("link"):
+        return td["link"]
+    pd_ = oss.get("photo_data") or {}
+    cta_link = ((pd_.get("call_to_action") or {}).get("value") or {}).get("link")
+    if cta_link:
+        return cta_link
     afs = creative.get("asset_feed_spec") or {}
     for lu in afs.get("link_urls") or []:
         if lu.get("website_url"):
             return lu["website_url"]
+    if creative.get("template_url"):
+        return creative["template_url"]
+    if creative.get("link_destination_display_url"):
+        return creative["link_destination_display_url"]
     return ""
 
 
@@ -407,7 +455,7 @@ def main():
         with lock:
             known = dict(url_cache)
         fetched = {}
-        missing = [a for a in ad_ids if a and a not in known]
+        missing = [a for a in ad_ids if a and not known.get(a)]
         if missing:
             fetch_ad_urls_for(missing, fetched)
         with lock:
