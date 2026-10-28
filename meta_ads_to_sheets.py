@@ -212,7 +212,7 @@ def load_url_cache(sh):
 def save_url_cache(ws, cache):
     rows = [["ad_id", "link_url"]] + [[k, v] for k, v in sorted(cache.items()) if v]
     ws.clear()
-    ws.update(range_name="A1", values=rows, value_input_option="RAW")
+    write_in_chunks(ws, rows)
 
 
 def batch_get(relative_urls):
@@ -437,6 +437,16 @@ def open_sheet(sh):
     return ws
 
 
+def write_in_chunks(ws, rows, chunk=4000):
+    """Sheets API のペイロード上限(約10MB)を避けるため分割して書き込む"""
+    need = len(rows) + 10
+    if ws.row_count < need:
+        ws.add_rows(need - ws.row_count)
+    for i in range(0, len(rows), chunk):
+        ws.update(range_name=f"A{i + 1}", values=rows[i:i + chunk], value_input_option="RAW")
+        time.sleep(1)
+
+
 def upsert(ws, new_rows, start, end, accounts):
     """対象期間・対象アカウントの既存行を削除して新しい行に差し替える"""
     existing = ws.get_all_values()
@@ -447,9 +457,9 @@ def upsert(ws, new_rows, start, end, accounts):
         if not (start <= r[0] <= end and r[1] in acc_ids)
     ]
     all_rows = keep + new_rows
-    all_rows.sort(key=lambda r: (r[0], r[1], r[4], r[6], r[8]))
+    all_rows.sort(key=lambda r: (str(r[0]), str(r[1]), str(r[4]), str(r[6]), str(r[8])))
     ws.clear()
-    ws.update(range_name="A1", values=[HEADER] + all_rows, value_input_option="RAW")
+    write_in_chunks(ws, [HEADER] + all_rows)
     ws.freeze(rows=1)
     print(f"sheet updated: kept {len(keep)} rows, added {len(new_rows)} rows", flush=True)
 
@@ -499,6 +509,10 @@ def main():
         out = []
         for r in acc_rows:
             results, rtype = pick_result(r)
+            # 実績ゼロの行（表示も消化もクリックも結果も無い）は除外
+            if int(r.get("impressions", 0) or 0) == 0 and float(r.get("spend", 0) or 0) == 0 \
+                    and int(r.get("inline_link_clicks", 0) or 0) == 0 and results == 0:
+                continue
             out.append([
                 r["date_start"], r["account_id"], r.get("account_name", ""),
                 r.get("campaign_id", ""), r.get("campaign_name", ""),
