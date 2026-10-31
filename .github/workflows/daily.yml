@@ -31,6 +31,8 @@ jobs:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           META_API_VERSION: ${{ secrets.META_API_VERSION }}
+          # IDで指定したアカウントに加えて、名前（一部一致）で対象に追加するアカウント
+          META_ACCOUNT_NAMES: "既存_新宿,既存_池袋,既存_横浜,既存_大阪,既存_仙台,既存_名古屋,既存_福岡"
           DAYS_BACK: "7"
         run: |
           if [ -n "${{ github.event.inputs.start_date }}" ]; then
