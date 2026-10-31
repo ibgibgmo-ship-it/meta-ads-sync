@@ -192,6 +192,30 @@ def resolve_accounts():
     return found
 
 
+URL_TAB = "ad_urls"
+
+
+def load_url_cache(sh):
+    """ad_urls タブから ad_id -> link_url のキャッシュを読む"""
+    try:
+        ws = sh.worksheet(URL_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(URL_TAB, rows=1000, cols=2)
+        ws.append_row(["ad_id", "link_url"])
+        return ws, {}
+    cache = {}
+    for row in ws.get_all_values()[1:]:
+        if row and row[0] and len(row) > 1 and row[1]:
+            cache[row[0]] = row[1]
+    return ws, cache
+
+
+def save_url_cache(ws, cache):
+    rows = [["ad_id", "link_url"]] + [[k, v] for k, v in sorted(cache.items()) if v]
+    ws.clear()
+    write_in_chunks(ws, rows)
+
+
 def batch_get(relative_urls):
     """Graph API バッチ（50件/回）。戻り値: relative_url順の JSON（失敗は None）"""
     out = []
