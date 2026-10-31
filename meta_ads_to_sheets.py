@@ -175,44 +175,21 @@ def paginate(url, params, limit=100, min_limit=10):
 
 
 def resolve_accounts():
-    """対象アカウントの act_ID リストを決める"""
-    if not ACCOUNT_NAMES:
-        if not ACCOUNT_IDS:
-            raise RuntimeError("META_AD_ACCOUNT_IDS か META_ACCOUNT_NAMES のどちらかを設定してください")
-        return ACCOUNT_IDS
-    found = []
-    for acc in paginate(f"{BASE}/me/adaccounts", {"fields": "id,name,account_status"}, limit=100):
-        name = acc.get("name") or ""
-        if any(n in name for n in ACCOUNT_NAMES):
-            found.append(acc["id"])
-            print(f"target: {acc['id']} {name}", flush=True)
+    """対象アカウント: META_AD_ACCOUNT_IDS と META_ACCOUNT_NAMES（名前で検索）の和集合"""
+    found = list(ACCOUNT_IDS)
+    if ACCOUNT_NAMES:
+        hit = 0
+        for acc in paginate(f"{BASE}/me/adaccounts", {"fields": "id,name,account_status"}, limit=100):
+            name = acc.get("name") or ""
+            if any(n in name for n in ACCOUNT_NAMES) and acc["id"] not in found:
+                found.append(acc["id"])
+                print(f"target by name: {acc['id']} {name}", flush=True)
+                hit += 1
+        if hit == 0:
+            print(f"warning: 名前に一致する広告アカウントが見つかりません: {ACCOUNT_NAMES}", flush=True)
     if not found:
-        raise RuntimeError(f"名前に一致する広告アカウントが見つかりません: {ACCOUNT_NAMES}")
+        raise RuntimeError("META_AD_ACCOUNT_IDS か META_ACCOUNT_NAMES のどちらかを設定してください")
     return found
-
-
-URL_TAB = "ad_urls"
-
-
-def load_url_cache(sh):
-    """ad_urls タブから ad_id -> link_url のキャッシュを読む"""
-    try:
-        ws = sh.worksheet(URL_TAB)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(URL_TAB, rows=1000, cols=2)
-        ws.append_row(["ad_id", "link_url"])
-        return ws, {}
-    cache = {}
-    for row in ws.get_all_values()[1:]:
-        if row and row[0]:
-            cache[row[0]] = row[1] if len(row) > 1 else ""
-    return ws, cache
-
-
-def save_url_cache(ws, cache):
-    rows = [["ad_id", "link_url"]] + [[k, v] for k, v in sorted(cache.items()) if v]
-    ws.clear()
-    write_in_chunks(ws, rows)
 
 
 def batch_get(relative_urls):
@@ -428,13 +405,22 @@ def open_spreadsheet():
     return gc.open_by_key(SHEET_ID)
 
 
-def open_sheet(sh):
+def open_sheet(sh, month):
+    """月別タブ（例: data_2026-10）を開く。無ければ作成"""
+    name = f"{SHEET_TAB}_{month}"
     try:
-        ws = sh.worksheet(SHEET_TAB)
+        ws = sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(SHEET_TAB, rows=1000, cols=len(HEADER))
+        ws = sh.add_worksheet(name, rows=1000, cols=len(HEADER))
         ws.append_row(HEADER)
     return ws
+
+
+def months_between(start, end):
+    cur = date(start.year, start.month, 1)
+    while cur <= end:
+        yield cur.strftime("%Y-%m")
+        cur = date(cur.year + (cur.month // 12), (cur.month % 12) + 1, 1)
 
 
 def write_in_chunks(ws, rows, chunk=4000):
@@ -540,8 +526,14 @@ def main():
         save_url_cache(url_ws, url_cache)
     print(f"fetched {len(rows)} rows from {len(done)} accounts", flush=True)
     if done:
-        ws = open_sheet(sh)
-        upsert(ws, rows, start.isoformat(), end.isoformat(), done)
+        # 月別タブに振り分けて書き込む
+        for month in months_between(start, end):
+            m_start = max(start.isoformat(), f"{month}-01")
+            m_end = min(end.isoformat(), f"{month}-31")
+            m_rows = [r for r in rows if str(r[0])[:7] == month]
+            ws = open_sheet(sh, month)
+            print(f"[{SHEET_TAB}_{month}] ", end="", flush=True)
+            upsert(ws, m_rows, m_start, m_end, done)
     if failed:
         raise SystemExit(f"failed accounts (次回実行で取り直されます): {failed}")
 
