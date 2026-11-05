@@ -28,6 +28,7 @@ jobs:
         env:
           TIKTOK_ACCESS_TOKEN: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
           TIKTOK_ADVERTISER_IDS: ${{ secrets.TIKTOK_ADVERTISER_IDS }}
+          TIKTOK_ACCOUNT_NAMES: "Aクリニック"   # この文字列を含むアカウント名だけ対象
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           DAYS_BACK: "7"
