@@ -8,6 +8,7 @@ Googleスプレッドシートの月別タブ（tiktok_ads_YYYY-MM）に書き�
 必要な環境変数:
   TIKTOK_ACCESS_TOKEN      Marketing API のアクセストークン（無期限）
   TIKTOK_ADVERTISER_IDS    "1234567890,2345678901"（広告アカウントID、カンマ区切り）
+  TIKTOK_ACCOUNT_NAMES     任意。"Aクリニック" のように名前の一部を指定すると、それを含むアカウントだけ対象
   GOOGLE_SA_JSON           Googleサービスアカウントの鍵JSON
   SHEET_ID                 スプレッドシートID
 任意:
@@ -32,6 +33,8 @@ from google.oauth2.service_account import Credentials
 BASE = "https://business-api.tiktok.com/open_api/v1.3"
 TOKEN = os.environ["TIKTOK_ACCESS_TOKEN"]
 ADVERTISERS = [a.strip() for a in os.environ["TIKTOK_ADVERTISER_IDS"].split(",") if a.strip()]
+# アカウント名の一部で対象を絞る（例: "Aクリニック"）。空なら全アカウント
+ACCOUNT_NAMES = [a.strip() for a in os.environ.get("TIKTOK_ACCOUNT_NAMES", "").split(",") if a.strip()]
 SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = os.environ.get("SHEET_TAB", "tiktok_ads")
 DAYS_BACK = int(os.environ.get("DAYS_BACK", "7"))
@@ -194,15 +197,21 @@ def main():
     else:
         end = today_jst
         start = end - timedelta(days=DAYS_BACK - 1)
-    print(f"range: {start} .. {end}, accounts: {len(ADVERTISERS)}", flush=True)
-
     names = advertiser_names(ADVERTISERS)
+    advertisers = ADVERTISERS
+    if ACCOUNT_NAMES:
+        advertisers = [a for a in ADVERTISERS if any(n in names.get(a, "") for n in ACCOUNT_NAMES)]
+        for a in advertisers:
+            print(f"target: {a} {names.get(a, '')}", flush=True)
+        if not advertisers:
+            raise RuntimeError(f"名前に一致する広告アカウントがありません: {ACCOUNT_NAMES} / 候補: {names}")
+    print(f"range: {start} .. {end}, accounts: {len(advertisers)}", flush=True)
     sh = open_spreadsheet()
     url_ws, url_cache = load_url_cache(sh)
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     rows, done, failed = [], [], []
-    for adv in ADVERTISERS:
+    for adv in advertisers:
         try:
             acc_rows = []
             for s_, e_ in daterange_chunks(start, end):
